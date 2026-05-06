@@ -8,8 +8,26 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Dict, List, Optional, Set, Tuple
 import math
+import time
 
-
+def misura_tempo(func):
+    def wrapper(*args, **kwargs):
+        # Registra il tempo di inizio
+        inizio = time.perf_counter()
+        
+        # Esegue la funzione originale
+        risultato = func(*args, **kwargs)
+        
+        # Registra il tempo di fine
+        fine = time.perf_counter()
+        
+        # Calcola e stampa la durata
+        durata = fine - inizio
+        print(f"Funzione '{func.__name__}' eseguita in: {durata:.4f} secondi")
+        
+        return risultato
+    return wrapper
+    
 class MultiheadAttentionLoRA(nn.Module):
     """
     Custom MultiheadAttention that doesn't use F.multi_head_attention_forward,
@@ -527,8 +545,8 @@ def save_lora_weights(model: nn.Module, save_path: str):
     torch.save(lora_state_dict, save_path)
     print(f"Saved LoRA weights to {save_path}")
 
-
-def load_lora_weights(model: nn.Module, load_path: str):
+@misura_tempo
+def load_lora_weights(model: nn.Module, load_path: str, lora_state_dict_in = None):
     """
     Load LoRA weights into a model.
 
@@ -536,6 +554,190 @@ def load_lora_weights(model: nn.Module, load_path: str):
         model: Model with LoRA layers
         load_path: Path to LoRA weights
     """
-    lora_state_dict = torch.load(load_path)
+    if (lora_state_dict_in):
+        lora_state_dict = lora_state_dict_in
+    else:
+        lora_state_dict = torch.load(load_path)
+    
     model.load_state_dict(lora_state_dict, strict=False)
     print(f"Loaded LoRA weights from {load_path}")
+
+@misura_tempo
+def apply_lora_to_model_v1(model: nn.Module, config: LoRAConfig) -> nn.Module:
+    """
+    Apply LoRA to specified modules in the SAM3 model.
+
+    This function:
+    1. Replaces nn.MultiheadAttention with MultiheadAttentionLoRA (enables LoRA on Q/K/V/out_proj)
+    2. Applies LoRA to all matching Linear layers
+    3. Saves the original modules in model._lora_original_modules for later restoration
+
+    Args:
+        model: SAM3 model to apply LoRA to
+        config: LoRA configuration
+
+    Returns:
+        Model with LoRA applied
+
+    Raises:
+        RuntimeError: If LoRA has already been applied to this model
+    """
+
+    # Check if LoRA has already been applied
+    if hasattr(model, '_lora_original_modules'):
+        raise RuntimeError("LoRA has already been applied to this model. "
+                           "Call restore_original_model() first if you need to reapply.")
+
+    # CRITICAL: Freeze all base model parameters first
+    for param in model.parameters():
+        param.requires_grad = False
+
+    # Storage for original modules (full name -> original module)
+    model._lora_original_modules = {}
+
+    def should_apply_lora_to_component(module_name: str) -> bool:
+        """Check component-level flags to determine if we should apply LoRA."""
+        if ("vision_encoder" in module_name or "vision_backbone" in module_name) and not config.apply_to_vision_encoder:
+            return False
+        if ("text_encoder" in module_name or "language_backbone" in module_name) and not config.apply_to_text_encoder:
+            return False
+        if "geometry_encoder" in module_name and not config.apply_to_geometry_encoder:
+            return False
+        if ("detr_encoder" in module_name or "transformer.encoder" in module_name) and not config.apply_to_detr_encoder:
+            return False
+        if ("detr_decoder" in module_name or "transformer.decoder" in module_name) and not config.apply_to_detr_decoder:
+            return False
+        if "mask_decoder" in module_name and not config.apply_to_mask_decoder:
+            return False
+        return True
+
+    def should_apply_lora(module_name: str) -> bool:
+        """Determine if LoRA should be applied to this module."""
+        if not should_apply_lora_to_component(module_name):
+            return False
+
+        # Check if module name matches target modules
+        module_basename = module_name.split('.')[-1]
+
+        # Direct basename match (e.g., "qkv", "proj", "linear1", etc.)
+        if module_basename in config.target_modules:
+            return True
+
+        # Also check for substring match for flexibility
+        for target in config.target_modules:
+            if target in module_basename:
+                return True
+
+        return False
+
+    # Track replacements
+    mha_replaced = []
+    lora_modules_applied = []
+
+    # STEP 1: Replace nn.MultiheadAttention with MultiheadAttentionLoRA
+    mha_to_replace = []
+    for name, module in model.named_modules():
+        if isinstance(module, nn.MultiheadAttention):
+            if should_apply_lora_to_component(name):
+                mha_to_replace.append((name, module))
+
+    for name, mha in mha_to_replace:
+        # Get parent module and attribute name
+        *parent_path, attr_name = name.split('.')
+        parent = model
+        for p in parent_path:
+            parent = getattr(parent, p)
+
+        # Save original module
+        model._lora_original_modules[name] = mha
+
+        # Create replacement with separate Q, K, V projections
+        new_mha = MultiheadAttentionLoRA(
+            embed_dim=mha.embed_dim,
+            num_heads=mha.num_heads,
+            dropout=mha.dropout,
+            bias=mha.in_proj_bias is not None,
+            batch_first=mha.batch_first,
+            in_proj_weight=mha.in_proj_weight,
+            in_proj_bias=mha.in_proj_bias,
+            out_proj_weight=mha.out_proj.weight,
+            out_proj_bias=mha.out_proj.bias if mha.out_proj.bias is not None else None,
+        )
+
+        # Freeze the new MHA parameters (they will be partially unfrozen by LoRALinear later)
+        for param in new_mha.parameters():
+            param.requires_grad = False
+
+        setattr(parent, attr_name, new_mha)
+        mha_replaced.append(name)
+
+    print(f"Replaced {len(mha_replaced)} nn.MultiheadAttention modules with MultiheadAttentionLoRA")
+
+    # STEP 2: Apply LoRA to all matching Linear layers
+    for name, module in model.named_modules():
+        if isinstance(module, nn.Linear) and should_apply_lora(name):
+            # Get parent module and attribute name
+            *parent_path, attr_name = name.split('.')
+            parent = model
+            for p in parent_path:
+                parent = getattr(parent, p)
+
+            # Save original linear module
+            model._lora_original_modules[name] = module
+
+            # Replace with LoRA linear
+            lora_linear = LoRALinear(
+                module,
+                rank=config.rank,
+                alpha=config.alpha,
+                dropout=config.dropout,
+            )
+            setattr(parent, attr_name, lora_linear)
+            lora_modules_applied.append(name)
+
+    print(f"Applied LoRA to {len(lora_modules_applied)} modules:")
+    for module_name in lora_modules_applied[:15]:
+        print(f"  - {module_name}")
+    if len(lora_modules_applied) > 15:
+        print(f"  ... and {len(lora_modules_applied) - 15} more")
+
+    return model
+
+
+def restore_original_model_v1(model: nn.Module) -> nn.Module:
+    """
+    Restore the original modules that were replaced by apply_lora_to_model.
+
+    This function uses the stored originals in model._lora_original_modules
+    to revert the model to its pre-LoRA state. It then removes the storage
+    attribute to clean up.
+
+    Args:
+        model: Model that had LoRA applied
+
+    Returns:
+        Model with original modules restored
+
+    Raises:
+        RuntimeError: If no original modules are found (model not modified)
+    """
+    if not hasattr(model, '_lora_original_modules'):
+        raise RuntimeError("No original modules found. This model does not appear to have LoRA applied.")
+
+    # Restore each original module
+    for name, original_module in model._lora_original_modules.items():
+        # Get parent module and attribute name
+        *parent_path, attr_name = name.split('.')
+        parent = model
+        for p in parent_path:
+            parent = getattr(parent, p)
+
+        # Replace current module with original
+        setattr(parent, attr_name, original_module)
+
+    # Remove the storage attribute
+    delattr(model, '_lora_original_modules')
+
+    print(f"Restored original modules. LoRA has been removed.")
+
+    return model

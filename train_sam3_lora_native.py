@@ -55,6 +55,8 @@ from torchvision.transforms import v2
 import pycocotools.mask as mask_utils  # Required for RLE mask decoding in COCO dataset
 from sam3.train.masks_ops import rle_encode  # For encoding masks to RLE format
 
+os.environ['PYTORCH_ALLOC_CONF'] = 'expandable_segments:True'
+
 # Note: Evaluation modules (mAP, cgF1, NMS) are in validate_sam3_lora.py
 # Training only computes validation loss, following SAM3's approach
 
@@ -215,7 +217,17 @@ class COCOSegmentDataset(Dataset):
                     # Check if it's RLE format (dict) or polygon format (list)
                     if isinstance(segmentation, dict):
                         # RLE format: {"counts": "...", "size": [h, w]}
-                        mask_np = mask_utils.decode(segmentation)
+
+                        # Caso 1: RLE non compresso → counts è una lista
+                        if isinstance(segmentation["counts"], list):
+                            h, w = segmentation["size"]
+                            rle = mask_utils.frPyObjects(segmentation, h, w)
+                        else:
+                            # Caso 2: RLE compresso
+                            rle = segmentation
+
+                        mask_np = mask_utils.decode(rle)
+
                     elif isinstance(segmentation, list):
                         # Polygon format: [[x1, y1, x2, y2, ...], ...]
                         # Convert polygon to RLE, then decode
@@ -777,6 +789,11 @@ class SAM3TrainerNative:
             self.device = torch.device(f"cuda:{self.local_rank}")
             print_rank0(f"Multi-GPU training enabled with {self.world_size} GPUs")
         else:
+            if torch.cuda.is_available():
+                # These flags are supported in PyTorch as described in the docs
+                torch.backends.cuda.matmul.allow_tf32 = True
+                torch.backends.cudnn.allow_tf32 = True
+                print("TF32 matmul enabled:", torch.backends.cuda.matmul.allow_tf32)
             self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         # Build Model
@@ -1012,7 +1029,10 @@ class SAM3TrainerNative:
 
             # Only show progress bar on rank 0
             pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}", disable=not is_main_process())
+            i=0
             for batch_dict in pbar:
+                torch.cuda.empty_cache()
+
                 input_batch = batch_dict["input"]
 
                 # Move to device
@@ -1021,6 +1041,8 @@ class SAM3TrainerNative:
                 # Forward pass
                 # outputs_list is SAM3Output, we need to pass the whole thing to loss_wrapper
                 outputs_list = self.model(input_batch)
+
+                torch.cuda.empty_cache()
 
                 # Prepare targets for loss
                 # input_batch.find_targets is a list of BatchedFindTarget (one per stage)
@@ -1058,11 +1080,13 @@ class SAM3TrainerNative:
 
                 # Backward
                 self.optimizer.zero_grad()
+                torch.cuda.empty_cache()
                 total_loss.backward()
                 self.optimizer.step()
 
                 # Track training loss
                 train_losses.append(total_loss.item())
+
                 pbar.set_postfix({"loss": total_loss.item()})
 
             # Calculate average training loss for this epoch
